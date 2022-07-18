@@ -1,0 +1,9 @@
+[{
+        "ParameterKey": "ProjectName",
+        "ParameterValue": "UdagramApp"
+    },
+    {
+        "ParameterKey": "S3BucketName",
+        "ParameterValue": "udagramapp-nonso"
+    }
+]

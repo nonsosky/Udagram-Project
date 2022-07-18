@@ -1,0 +1,233 @@
+Description: >
+  Okpara Kenneth Chinonso | Udacity 2022
+  AWS-CloudFormation script to create an EC2 instance.
+
+#Parameters
+Parameters:
+  ProjectName:
+    Description: An environment name that will be prefixed to resource names
+    Type: String
+    Default: UdagramApp
+
+Mappings:
+  WebAppRegion:
+    us-east-1:
+      HVM64: ami-005de95e8ff495156
+
+# Resources
+Resources:
+  LBSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: LBSecGroup
+      GroupDescription: Allow http to our load balancer
+      VpcId:
+        Fn::ImportValue: !Sub '${ProjectName}-VPCID'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName} LBSecGroup
+
+  WebServerSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: WebServerSecGroup
+      GroupDescription: Allow http to our hosts and SSH access
+      VpcId:
+        Fn::ImportValue: !Sub '${ProjectName}-VPCID'
+      SecurityGroupIngress:
+        # 80 to 80 important for healthchecks !
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 0
+          ToPort: 65535
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName} WebServerSecGroup
+
+
+  WebAppLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+           apt-get update -y
+           apt-get install apache2 -y
+           systemctl start apache2.service
+           cd /var/www/html
+           echo "it works! Udagram, Udacity" > index.html
+      IamInstanceProfile:
+        Fn::ImportValue: !Sub '${ProjectName}-IAM-NAME'
+      SecurityGroups:
+        - Ref: 'WebServerSecGroup'
+      BlockDeviceMappings:
+        - DeviceName: '/dev/sdk'
+          Ebs:
+            VolumeSize: '10'
+            DeleteOnTermination: true
+            VolumeType: 'gp2'
+      ImageId: !FindInMap [WebAppRegion, !Ref 'AWS::Region', HVM64]
+      InstanceType: t3.small
+
+  WebAppASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      MinSize: 4
+      MaxSize: 4
+      DesiredCapacity: 4
+      VPCZoneIdentifier:
+        - Fn::ImportValue: !Sub '${ProjectName}-PRI1-SN'
+        - Fn::ImportValue: !Sub '${ProjectName}-PRI2-SN'
+      LaunchConfigurationName: !Ref WebAppLaunchConfig
+      TargetGroupARNs:
+        - Ref: WebAppTG
+
+  WebAppLB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: udagramApp
+      Subnets:
+        - Fn::ImportValue: !Sub '${ProjectName}-PUB1-SN'
+        - Fn::ImportValue: !Sub '${ProjectName}-PUB2-SN'
+      SecurityGroups:
+        - Ref: LBSecGroup
+
+  WebAppListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WebAppTG
+      LoadBalancerArn: !Ref WebAppLB
+      Port: 80
+      Protocol: HTTP
+
+  WebAppLR:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref WebAppTG
+      Conditions:
+        - Field: path-pattern
+          Values: [/]
+      ListenerArn: !Ref WebAppListener
+      Priority: 1
+
+  WebAppTG:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 8
+      HealthyThresholdCount: 2
+      Port: 80
+      Protocol: HTTP
+      UnhealthyThresholdCount: 5
+      VpcId:
+        Fn::ImportValue:
+          Fn::Sub: '${ProjectName}-VPCID'
+
+  #ScalingUp
+  WebAppScaleUp:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref WebAppASG
+      Cooldown: 300
+      ScalingAdjustment: 1
+
+  #ScalingDown
+  WebAppScaleDown:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref WebAppASG
+      Cooldown: 300
+      ScalingAdjustment: -1
+
+  #CloudWatch alerts
+  WebAppCPUHighAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: 'WebAppCPUUsageHigh'
+      AlarmDescription: 'CPU usage is greater than 80% for 5 minutes'
+      MetricName: 'CPUUtilization'
+      Namespace: 'AWS/EC2'
+      Statistic: 'Average'
+      Period: '300'
+      EvaluationPeriods: '1'
+      Threshold: '80'
+      ComparisonOperator: 'GreaterThanThreshold'
+      AlarmActions:
+        - Ref: 'WebAppScaleUp'
+      Dimensions:
+        - Name: 'AutoScalingGroupName'
+          Value:
+            Ref: 'WebAppASG'
+
+  #CloudWatch alerts
+  WebAppCPULowAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: 'WebAppCPUUsageLow'
+      AlarmDescription: 'CPU usage is less than 25% for 5 minutes'
+      MetricName: 'CPUUtilization'
+      Namespace: 'AWS/EC2'
+      Statistic: 'Average'
+      Period: '300'
+      EvaluationPeriods: '1'
+      Threshold: '25'
+      ComparisonOperator: 'GreaterThanThreshold'
+      AlarmActions:
+        - Ref: 'WebAppScaleDown'
+      Dimensions:
+        - Name: 'AutoScalingGroupName'
+          Value:
+            Ref: 'WebAppASG'
+
+  #Outputs 
+Outputs:
+  Website:
+    Description: The Public DNS for the EC2 Instance
+    Value: !Join ['', ['http://', !GetAtt [WebAppLB, DNSName]]]
+
+  WebAppCPUHighAlarm:
+    Description: 'CloudWatch to send alarms when EC2 CPU is High'
+    Value: !Ref 'WebAppCPUHighAlarm'
+
+  WebAppCPULowAlarm:
+    Description: 'CloudWatch to send alarms when EC2 CPU is Low'
+    Value: !Ref 'WebAppCPULowAlarm'
+
+  WebAppASG:
+    Description: 'Group ID of Auto Scaling Group Reference ID'
+    Value: !Ref 'WebAppASG'
+
+  WebAppScaleUp:
+    Description: 'Policy ID of Auto Scaling Up'
+    Value: !Ref 'WebAppScaleUp'
+
+  WebAppScaleDown:
+    Description: 'Policy ID of Auto Scaling Down'
+    Value: !Ref 'WebAppScaleDown'
